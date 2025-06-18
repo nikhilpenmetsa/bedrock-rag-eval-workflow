@@ -1,6 +1,6 @@
 # Bedrock RAG Evaluation Framework
 
-This project shows a simple workflow for evaluating a RAG system using [Amazon Bedrock Evaluations](https://docs.aws.amazon.com/bedrock/latest/userguide/evaluation-kb.html).
+This project shows a workflow for evaluating a RAG system using [Amazon Bedrock Evaluations](https://docs.aws.amazon.com/bedrock/latest/userguide/evaluation-kb.html).
 
 ## Overview
 
@@ -8,7 +8,7 @@ Evaluation frameworks are essential for maintaining predictable behavior when ev
 
 In this solution, we use the [rag-mini dataset](https://huggingface.co/datasets/rag-datasets/rag-mini-wikipedia) as the knowledge base for this evaluation framework. A subset of this data is used as ground-truth.
 
-![Evaluation Workflow](https://raw.githubusercontent.com/aws-samples/bedrock-rag-eval/main/images/stepfunctions_graph.svg)
+![Evaluation Workflow](https://github.com/nikhilpenmetsa/bedrock-rag-eval-workflow/blob/main/images/stepfunctions_graph.svg)
 
 ## Project Structure
 
@@ -44,9 +44,9 @@ bedrock-rag-eval/
 ### Prerequisites
 
 - AWS CLI installed and configured
-- Appropriate AWS permissions to create resources
+- Appropriate AWS bedrock model access (Nova Pro, Claude 3.7 Sonnet used in this repository )
 - An S3 bucket for storing evaluation datasets and results
-- A Bedrock knowledge base already set up
+- A Bedrock knowledge base with rag-mini dataset already set up.
 
 ### Deployment Steps
 
