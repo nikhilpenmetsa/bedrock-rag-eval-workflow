@@ -1,0 +1,616 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Bedrock RAG Evaluation Framework'
+
+Parameters:
+  S3BucketName:
+    Type: String
+    Description: S3 bucket for storing evaluation datasets and results
+  
+  EvaluationSchedule:
+    Type: String
+    Description: Schedule expression for the evaluation job (e.g., rate(1 day))
+    Default: rate(1 day)
+
+Resources:
+  # DynamoDB Table for storing evaluation results
+  EvaluationResultsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: BedrockRagEvaluationResults
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: evaluationId
+          AttributeType: S
+        - AttributeName: timestamp
+          AttributeType: S
+      KeySchema:
+        - AttributeName: evaluationId
+          KeyType: HASH
+        - AttributeName: timestamp
+          KeyType: RANGE
+
+  # IAM Role for Lambda functions
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: BedrockRagEvaluationPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - bedrock:CreateEvaluationJob
+                  - bedrock:GetEvaluationJob
+                  - bedrock:ListEvaluationJobs
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - ssm:GetParameter
+                Resource: !Sub 'arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/bedrock-rag-eval/*'
+              - Effect: Allow
+                Action:
+                  - dynamodb:PutItem
+                Resource: !GetAtt EvaluationResultsTable.Arn
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                  - s3:ListBucket
+                Resource:
+                  - !Sub 'arn:aws:s3:::${S3BucketName}'
+                  - !Sub 'arn:aws:s3:::${S3BucketName}/*'
+              - Effect: Allow
+                Action:
+                  - iam:PassRole
+                Resource: !GetAtt BedrockEvaluationRole.Arn
+
+  # IAM Role for Bedrock Evaluation
+  BedrockEvaluationRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: bedrock.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonBedrockFullAccess
+      Policies:
+        - PolicyName: BedrockS3Access
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                  - s3:ListBucket
+                Resource:
+                  - !Sub 'arn:aws:s3:::${S3BucketName}'
+                  - !Sub 'arn:aws:s3:::${S3BucketName}/*'
+        - PolicyName: BedrockModelAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - bedrock:InvokeModel
+                  - bedrock:InvokeModelWithResponseStream
+                Resource: 
+                  - !Sub 'arn:aws:bedrock:${AWS::Region}:${AWS::AccountId}:inference-profile/us.amazon.nova-pro-v1:0'
+                  - !Sub 'arn:aws:bedrock:${AWS::Region}:${AWS::AccountId}:inference-profile/us.anthropic.claude-3-7-sonnet-20250219-v1:0'
+                  - !Sub 'arn:aws:bedrock:${AWS::Region}::foundation-model/*'
+
+  # Lambda function to trigger evaluation
+  TriggerEvaluationFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: BedrockRagTriggerEvaluation
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Runtime: python3.13
+      Timeout: 60
+      MemorySize: 128
+      Environment:
+        Variables:
+          S3_BUCKET: !Ref S3BucketName
+          EXECUTION_ROLE_ARN: !GetAtt BedrockEvaluationRole.Arn
+          AWS_REGION_NAME: !Ref AWS::Region
+      Code:
+        ZipFile: |
+          import boto3
+          import os
+          import json
+          import logging
+          from datetime import datetime
+
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+
+          ssm = boto3.client('ssm')
+          bedrock = boto3.client('bedrock', region_name=os.environ['AWS_REGION_NAME'])
+
+          def get_parameter(name):
+              """Retrieve parameter from SSM Parameter Store"""
+              response = ssm.get_parameter(Name=name, WithDecryption=True)
+              return response['Parameter']['Value']
+
+          def lambda_handler(event, context):
+              """
+              Lambda function to trigger a Bedrock RAG evaluation job
+              """
+              try:
+                  # Get parameters from SSM Parameter Store
+                  application_name = get_parameter('/bedrock-rag-eval/application_name')
+                  kb_id = get_parameter('/bedrock-rag-eval/kb_id')
+                  evaluator_model_id = get_parameter('/bedrock-rag-eval/evaluator_model_id')
+                  generator_model_id = get_parameter('/bedrock-rag-eval/generator_model_id')
+                  
+                  # Generate job ID with timestamp
+                  timestamp = datetime.now().strftime("%Y%m%d%H%M%S")
+                  
+                  # Format job name to match pattern [a-z0-9](-*[a-z0-9]){0,62}
+                  # Convert to lowercase and replace underscores with hyphens
+                  app_name_formatted = application_name.lower().replace('_', '-')
+                  job_id = f"{app_name_formatted}-{timestamp}"
+                  
+                  # Get S3 location for input dataset and output results
+                  s3_bucket = os.environ['S3_BUCKET']
+                  dataset_s3_path = f"s3://{s3_bucket}/ground_truth/mini_wiki.jsonl"
+                  output_s3_path = f"s3://{s3_bucket}/evaluation-results/{job_id}/"
+                  
+                  # Create evaluation job with updated parameters
+                  response = bedrock.create_evaluation_job(
+                      jobName=job_id,
+                      clientRequestToken=job_id,
+                      applicationType="RagEvaluation",
+                      inferenceConfig={
+                          "ragConfigs": [
+                              {
+                                  "knowledgeBaseConfig": {
+                                      "retrieveAndGenerateConfig": {
+                                          "type": "KNOWLEDGE_BASE",
+                                          "knowledgeBaseConfiguration": {
+                                              "knowledgeBaseId": kb_id,
+                                              "modelArn": generator_model_id,
+                                              "retrievalConfiguration": {
+                                                  "vectorSearchConfiguration": {
+                                                      "numberOfResults": 5
+                                                  }
+                                              }
+                                          }
+                                      }
+                                  }
+                              }
+                          ]
+                      },
+                      evaluationConfig={
+                          "automated": {
+                              "datasetMetricConfigs": [
+                                  {
+                                      "taskType": "QuestionAndAnswer",
+                                      "dataset": {
+                                          "name": "mini-wiki-dataset",
+                                          "datasetLocation": {
+                                              "s3Uri": dataset_s3_path
+                                          }
+                                      },
+                                      "metricNames": [
+                                          "Builtin.Correctness",
+                                          "Builtin.Completeness",
+                                          "Builtin.Helpfulness",
+                                          "Builtin.LogicalCoherence",
+                                          "Builtin.Faithfulness"
+                                      ]
+                                  }
+                              ],
+                              "evaluatorModelConfig": {
+                                  "bedrockEvaluatorModels": [
+                                      {
+                                          "modelIdentifier": evaluator_model_id
+                                      }
+                                  ]
+                              }
+                          }
+                      },
+                      outputDataConfig={
+                          "s3Uri": output_s3_path
+                      },
+                      roleArn=os.environ['EXECUTION_ROLE_ARN']
+                  )
+                  
+                  job_arn = response['jobArn']
+                  logger.info(f"Started evaluation job with ARN: {job_arn}")
+                  
+                  return {
+                      'statusCode': 200,
+                      'jobArn': job_arn,
+                      'jobId': job_id
+                  }
+                  
+              except Exception as e:
+                  logger.error(f"Error triggering evaluation job: {str(e)}")
+                  raise e
+
+  # Lambda function to check evaluation status
+  CheckStatusFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: BedrockRagCheckEvaluationStatus
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Runtime: python3.13
+      Timeout: 30
+      MemorySize: 128
+      Environment:
+        Variables:
+          AWS_REGION_NAME: !Ref AWS::Region
+      Code:
+        ZipFile: |
+          import boto3
+          import os
+          import logging
+
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+
+          bedrock = boto3.client('bedrock', region_name=os.environ['AWS_REGION_NAME'])
+
+          def lambda_handler(event, context):
+              """
+              Lambda function to check the status of a Bedrock evaluation job
+              """
+              try:
+                  # Get job ARN from the event
+                  job_arn = event['jobArn']
+                  
+                  # Get job details
+                  response = bedrock.get_evaluation_job(jobIdentifier=job_arn)
+                  status = response['status']
+                  
+                  logger.info(f"Evaluation job {job_arn} status: {status}")
+                  
+                  # Return a proper object with status field
+                  return {
+                      'status': status.upper()  # Convert to uppercase to match Step Function expectations
+                  }
+                  
+              except Exception as e:
+                  logger.error(f"Error checking evaluation job status: {str(e)}")
+                  raise e
+
+  # Lambda function to process evaluation results
+  ProcessResultsFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: BedrockRagProcessResults
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Runtime: python3.13
+      Timeout: 60
+      MemorySize: 128
+      Environment:
+        Variables:
+          DYNAMODB_TABLE: !Ref EvaluationResultsTable
+          AWS_REGION_NAME: !Ref AWS::Region
+      Code:
+        ZipFile: |
+          import boto3
+          import os
+          import json
+          import logging
+          from datetime import datetime
+          from decimal import Decimal
+
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+
+          bedrock = boto3.client('bedrock', region_name=os.environ['AWS_REGION_NAME'])
+          dynamodb = boto3.resource('dynamodb')
+          s3 = boto3.client('s3')
+
+          def extract_metrics_from_json(json_obj):
+              """Extract metrics from a JSON object with various possible structures"""
+              metrics = {}
+              
+              # Direct extraction from the sample structure
+              if isinstance(json_obj, dict) and 'conversationTurns' in json_obj:
+                  for turn in json_obj.get('conversationTurns', []):
+                      if 'results' in turn:
+                          for result_item in turn.get('results', []):
+                              if 'metricName' in result_item and 'result' in result_item:
+                                  metric_name = result_item['metricName']
+                                  metric_value = result_item['result']
+                                  # Convert float to Decimal for DynamoDB
+                                  if isinstance(metric_value, float):
+                                      metric_value = Decimal(str(metric_value))
+                                  metrics[metric_name] = metric_value
+                                  logger.info(f"Found metric in conversationTurns: {metric_name} = {metric_value}")
+              
+              # Look for results array at the top level
+              if 'results' in json_obj and isinstance(json_obj['results'], list):
+                  for item in json_obj['results']:
+                      if 'metricName' in item and 'result' in item:
+                          metric_name = item['metricName']
+                          metric_value = item['result']
+                          # Convert float to Decimal for DynamoDB
+                          if isinstance(metric_value, float):
+                              metric_value = Decimal(str(metric_value))
+                          metrics[metric_name] = metric_value
+                          logger.info(f"Found metric in results array: {metric_name} = {metric_value}")
+              
+              return metrics
+
+          def lambda_handler(event, context):
+              """
+              Lambda function to process Bedrock RAG evaluation job results
+              and store them in DynamoDB
+              """
+              try:
+                  # Get job ARN from the Step Function state
+                  job_arn = event['jobArn']
+                  job_id = event['jobId']
+                  logger.info(f"Processing results for job ARN: {job_arn}, job ID: {job_id}")
+                  
+                  # Get job details
+                  job_response = bedrock.get_evaluation_job(jobIdentifier=job_arn)
+                  
+                  # Get S3 output location
+                  output_s3_uri = job_response['outputDataConfig']['s3Uri']
+                  bucket_name = output_s3_uri.replace('s3://', '').split('/')[0]
+                  logger.info(f"Output S3 URI: {output_s3_uri}, Bucket: {bucket_name}")
+                  
+                  # List objects in the output directory
+                  response = s3.list_objects_v2(
+                      Bucket=bucket_name,
+                      Prefix=f"evaluation-results/{job_id}/"
+                  )
+                  
+                  all_metrics = {}
+                  
+                  if 'Contents' in response:
+                      logger.info(f"Found {len(response['Contents'])} objects in output directory")
+                      
+                      # Look for output.jsonl files
+                      output_files = [obj['Key'] for obj in response['Contents'] 
+                                     if obj['Key'].endswith('.jsonl') or obj['Key'].endswith('.json')]
+                      
+                      for output_file in output_files:
+                          try:
+                              # Get file content
+                              file_response = s3.get_object(Bucket=bucket_name, Key=output_file)
+                              content = file_response['Body'].read().decode('utf-8')
+                              
+                              # Process each line
+                              for line in content.strip().split('\n'):
+                                  if line:
+                                      try:
+                                          json_obj = json.loads(line)
+                                          line_metrics = extract_metrics_from_json(json_obj)
+                                          if line_metrics:
+                                              all_metrics.update(line_metrics)
+                                      except json.JSONDecodeError:
+                                          pass
+                          except Exception as e:
+                              logger.error(f"Error processing file {output_file}: {str(e)}")
+                  
+                  logger.info(f"Extracted metrics: {all_metrics}")
+                  
+                  # Convert any remaining float values to Decimal
+                  for key, value in all_metrics.items():
+                      if isinstance(value, float):
+                          all_metrics[key] = Decimal(str(value))
+                  
+                  # Store in DynamoDB
+                  table = dynamodb.Table(os.environ['DYNAMODB_TABLE'])
+                  
+                  item = {
+                      'evaluationId': job_id,
+                      'timestamp': datetime.utcnow().isoformat(),
+                      'jobArn': job_arn,
+                      'status': job_response['status'],
+                      'metrics': all_metrics,
+                      's3ResultsPath': output_s3_uri
+                  }
+                  
+                  table.put_item(Item=item)
+                  
+                  logger.info(f"Stored evaluation results for job {job_id} in DynamoDB")
+                  
+                  return {
+                      'statusCode': 200,
+                      'message': 'Successfully processed evaluation results',
+                      'evaluationId': job_id,
+                      'metrics': all_metrics
+                  }
+                  
+              except Exception as e:
+                  logger.error(f"Error processing evaluation results: {str(e)}")
+                  raise e
+
+  # Step Function for evaluation workflow
+  EvaluationStateMachine:
+    Type: AWS::StepFunctions::StateMachine
+    Properties:
+      StateMachineName: BedrockRagEvaluationWorkflow
+      RoleArn: !GetAtt StepFunctionExecutionRole.Arn
+      DefinitionSubstitutions:
+        TriggerEvaluationLambdaArn: !GetAtt TriggerEvaluationFunction.Arn
+        CheckStatusLambdaArn: !GetAtt CheckStatusFunction.Arn
+        ProcessResultsLambdaArn: !GetAtt ProcessResultsFunction.Arn
+      DefinitionString: |
+        {
+          "Comment": "Bedrock RAG Evaluation Workflow",
+          "StartAt": "TriggerEvaluation",
+          "States": {
+            "TriggerEvaluation": {
+              "Type": "Task",
+              "Resource": "${TriggerEvaluationLambdaArn}",
+              "Next": "WaitForEvaluation",
+              "ResultPath": "$"
+            },
+            "WaitForEvaluation": {
+              "Type": "Wait",
+              "Seconds": 60,
+              "Next": "GetEvaluationStatus"
+            },
+            "GetEvaluationStatus": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::lambda:invoke",
+              "Parameters": {
+                "FunctionName": "${CheckStatusLambdaArn}",
+                "Payload": {
+                  "jobArn.$": "$.jobArn"
+                }
+              },
+              "ResultPath": "$.statusResult",
+              "Next": "CheckEvaluationStatus"
+            },
+            "CheckEvaluationStatus": {
+              "Type": "Choice",
+              "Choices": [
+                {
+                  "Variable": "$.statusResult.Payload.status",
+                  "StringEquals": "COMPLETED",
+                  "Next": "ProcessResults"
+                },
+                {
+                  "Variable": "$.statusResult.Payload.status",
+                  "StringEquals": "FAILED",
+                  "Next": "EvaluationFailed"
+                }
+              ],
+              "Default": "WaitForEvaluation"
+            },
+            "ProcessResults": {
+              "Type": "Task",
+              "Resource": "${ProcessResultsLambdaArn}",
+              "Parameters": {
+                "jobArn.$": "$.jobArn",
+                "jobId.$": "$.jobId"
+              },
+              "End": true
+            },
+            "EvaluationFailed": {
+              "Type": "Fail",
+              "Cause": "Bedrock RAG Evaluation job failed",
+              "Error": "EvaluationJobFailed"
+            }
+          }
+        }
+
+  # IAM Role for Step Functions
+  StepFunctionExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: states.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: StepFunctionLambdaInvoke
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - lambda:InvokeFunction
+                Resource:
+                  - !GetAtt TriggerEvaluationFunction.Arn
+                  - !GetAtt CheckStatusFunction.Arn
+                  - !GetAtt ProcessResultsFunction.Arn
+
+  # EventBridge Rule to trigger the Step Function
+  EvaluationScheduleRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: BedrockRagEvaluationSchedule
+      Description: Scheduled rule to trigger Bedrock RAG evaluation
+      ScheduleExpression: !Ref EvaluationSchedule
+      State: ENABLED
+      Targets:
+        - Arn: !Ref EvaluationStateMachine
+          Id: BedrockRagEvaluationTarget
+          RoleArn: !GetAtt EventBridgeRole.Arn
+
+  # IAM Role for EventBridge
+  EventBridgeRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: events.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: EventBridgeStepFunctionExecution
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - states:StartExecution
+                Resource: !Ref EvaluationStateMachine
+
+  # SSM Parameters for evaluation configuration
+  ApplicationNameParameter:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: /bedrock-rag-eval/application_name
+      Type: String
+      Value: underwriter_assistant
+      Description: Application name for the RAG evaluation
+
+  KnowledgeBaseIdParameter:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: /bedrock-rag-eval/kb_id
+      Type: String
+      Value: 3UWWAYOA4C
+      Description: Knowledge Base ID for RAG evaluation
+
+  EvaluatorModelIdParameter:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: /bedrock-rag-eval/evaluator_model_id
+      Type: String
+      Value: !Sub 'arn:aws:bedrock:${AWS::Region}:${AWS::AccountId}:inference-profile/us.amazon.nova-pro-v1:0'
+      Description: Model ID for the evaluator
+
+  GeneratorModelIdParameter:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: /bedrock-rag-eval/generator_model_id
+      Type: String
+      Value: !Sub 'arn:aws:bedrock:${AWS::Region}:${AWS::AccountId}:inference-profile/us.anthropic.claude-3-7-sonnet-20250219-v1:0'
+      Description: Model ID for the generator
+
+Outputs:
+  EvaluationStateMachineArn:
+    Description: ARN of the evaluation state machine
+    Value: !Ref EvaluationStateMachine
+
+  DynamoDBTableName:
+    Description: Name of the DynamoDB table for evaluation results
+    Value: !Ref EvaluationResultsTable
+
+  S3BucketName:
+    Description: S3 bucket for evaluation data and results
+    Value: !Ref S3BucketName

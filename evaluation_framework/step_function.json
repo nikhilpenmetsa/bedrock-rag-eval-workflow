@@ -1,0 +1,59 @@
+{
+  "Comment": "Bedrock RAG Evaluation Workflow",
+  "StartAt": "TriggerEvaluation",
+  "States": {
+    "TriggerEvaluation": {
+      "Type": "Task",
+      "Resource": "${TriggerEvaluationLambdaArn}",
+      "Next": "CheckEvaluationStatus",
+      "ResultPath": "$.evaluation"
+    },
+    "CheckEvaluationStatus": {
+      "Type": "Choice",
+      "Choices": [
+        {
+          "Variable": "$.evaluationStatus",
+          "StringEquals": "COMPLETED",
+          "Next": "ProcessResults"
+        },
+        {
+          "Variable": "$.evaluationStatus",
+          "StringEquals": "FAILED",
+          "Next": "EvaluationFailed"
+        }
+      ],
+      "Default": "WaitForEvaluation"
+    },
+    "WaitForEvaluation": {
+      "Type": "Wait",
+      "Seconds": 60,
+      "Next": "GetEvaluationStatus"
+    },
+    "GetEvaluationStatus": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": {
+        "FunctionName": "${CheckStatusLambdaArn}",
+        "Payload": {
+          "jobArn.$": "$.evaluation.jobArn"
+        }
+      },
+      "ResultPath": "$.evaluationStatus",
+      "Next": "CheckEvaluationStatus"
+    },
+    "ProcessResults": {
+      "Type": "Task",
+      "Resource": "${ProcessResultsLambdaArn}",
+      "Parameters": {
+        "jobArn.$": "$.evaluation.jobArn",
+        "jobId.$": "$.evaluation.jobId"
+      },
+      "End": true
+    },
+    "EvaluationFailed": {
+      "Type": "Fail",
+      "Cause": "Bedrock RAG Evaluation job failed",
+      "Error": "EvaluationJobFailed"
+    }
+  }
+}
